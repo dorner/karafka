@@ -54,8 +54,11 @@ module Karafka
           #   already processed but rather at the next one. This applies to both sync and async
           #   versions of this method.
           def mark_as_consumed(message, offset_metadata = @_current_offset_metadata)
+            # If we are inside a transaction than we can just mark as consumed within it
             if @_in_transaction
               mark_in_transaction(message, offset_metadata, true)
+            elsif @_in_transaction_marked
+              mark_in_memory(message)
             else
               # seek offset can be nil only in case `#seek` was invoked with offset reset request
               # In case like this we ignore marking
@@ -63,7 +66,16 @@ module Karafka
               # Ignore earlier offsets than the one we already committed
               return true if coordinator.seek_offset > message.offset
               return false if revoked?
-              return revoked? unless client.mark_as_consumed(message, offset_metadata)
+
+              # If we are not inside a transaction but this is a transactional topic, we mark with
+              # artificially created transaction
+              stored = if producer.transactional?
+                         mark_with_transaction(message, offset_metadata, true)
+                       else
+                         client.mark_as_consumed(message, offset_metadata)
+                       end
+
+              return revoked? unless stored
 
               coordinator.seek_offset = message.offset + 1
             end
@@ -82,6 +94,8 @@ module Karafka
           def mark_as_consumed!(message, offset_metadata = @_current_offset_metadata)
             if @_in_transaction
               mark_in_transaction(message, offset_metadata, false)
+            elsif @_in_transaction_marked
+              mark_in_memory(message)
             else
               # seek offset can be nil only in case `#seek` was invoked with offset reset request
               # In case like this we ignore marking
@@ -90,7 +104,15 @@ module Karafka
               return true if coordinator.seek_offset > message.offset
               return false if revoked?
 
-              return revoked? unless client.mark_as_consumed!(message, offset_metadata)
+              # If we are not inside a transaction but this is a transactional topic, we mark with
+              # artificially created transaction
+              stored = if producer.transactional?
+                         mark_with_transaction(message, offset_metadata, false)
+                       else
+                         client.mark_as_consumed!(message, offset_metadata)
+                       end
+
+              return revoked? unless stored
 
               coordinator.seek_offset = message.offset + 1
             end
@@ -112,7 +134,7 @@ module Karafka
           #   managing multiple producers. If not provided, default producer taken from `#producer`
           #   will be used.
           #
-          # @param block [Proc] code that we want to run in a transaction
+          # @yield code that we want to run in a transaction
           #
           # @note Please note, that if you provide the producer, it will reassign the producer of
           #   the consumer for the transaction time. This means, that in case you would even
@@ -120,7 +142,7 @@ module Karafka
           #   reassigned producer and not the initially used/assigned producer. It is done that
           #   way, so the message producing aliases operate from within transactions and since the
           #   producer in transaction is locked, it will prevent other threads from using it.
-          def transaction(active_producer = producer, &block)
+          def transaction(active_producer = producer)
             default_producer = producer
             self.producer = active_producer
 
@@ -132,8 +154,16 @@ module Karafka
             transaction_started = true
             @_transaction_marked = []
             @_in_transaction = true
+            @_in_transaction_marked = false
 
-            producer.transaction(&block)
+            producer.transaction do
+              yield
+
+              # Ensure this transaction is rolled back if we have lost the ownership of this
+              # transaction. We do it only for transactions that contain offset management as for
+              # producer only, this is not relevant.
+              raise Errors::AssignmentLostError if @_in_transaction_marked && revoked?
+            end
 
             @_in_transaction = false
 
@@ -142,6 +172,11 @@ module Karafka
             #
             # @note We never need to use the blocking `#mark_as_consumed!` here because the offset
             #   anyhow was already stored during the transaction
+            #
+            # @note Since the offset could have been already stored in Kafka (could have because
+            #   you can have transactions without marking), we use the `@_in_transaction_marked`
+            #   state to decide if we need to dispatch the offset via client at all
+            #   (if post transaction, then we do not have to)
             #
             # @note In theory we could only keep reference to the most recent marking and reject
             #   others. We however do not do it for two reasons:
@@ -152,12 +187,15 @@ module Karafka
             @_transaction_marked.each do |marking|
               marking.pop ? mark_as_consumed(*marking) : mark_as_consumed!(*marking)
             end
+
+            true
           ensure
             self.producer = default_producer
 
             if transaction_started
               @_transaction_marked.clear
               @_in_transaction = false
+              @_in_transaction_marked = false
             end
           end
 
@@ -178,13 +216,60 @@ module Karafka
               offset_metadata
             )
 
+            @_in_transaction_marked = true
             @_transaction_marked ||= []
             @_transaction_marked << [message, offset_metadata, async]
           end
 
+          # @private
+          # @param message [Messages::Message] message we want to commit inside of a transaction
+          # @param offset_metadata [String, nil] offset metadata or nil if none
+          # @param async [Boolean] should we mark in async or sync way (applicable only to post
+          #   transaction state synchronization usage as within transaction it is always sync)
+          # @return [Boolean] false if marking failed otherwise true
+          def mark_with_transaction(message, offset_metadata, async)
+            # This flag is used by VPs to differentiate between user initiated transactions and
+            # post-execution system transactions.
+            @_transaction_internal = true
+
+            transaction do
+              mark_in_transaction(message, offset_metadata, async)
+            end
+
+            true
+          # We handle both cases here because this is a private API for internal usage and we want
+          # the post-user code execution marking with transactional producer to result in a
+          # boolean state of marking for further framework flow. This is a normalization to make it
+          # behave the same way as it would behave with a non-transactional one
+          rescue ::Rdkafka::RdkafkaError, Errors::AssignmentLostError
+            false
+          ensure
+            @_transaction_internal = false
+          end
+
+          # Marks the current state only in memory as the offset marking has already happened
+          # using the producer transaction
+          # @param message [Messages::Message] last successfully processed message.
+          # @return [Boolean] true if all good, false if we lost assignment and no point in marking
+          def mark_in_memory(message)
+            # seek offset can be nil only in case `#seek` was invoked with offset reset request
+            # In case like this we ignore marking
+            return true if coordinator.seek_offset.nil?
+            # Ignore earlier offsets than the one we already committed
+            return true if coordinator.seek_offset > message.offset
+            return false if revoked?
+
+            # If we have already marked this successfully in a transaction that was running
+            # we should not mark it again with the client offset delegation but instead we should
+            # just align the in-memory state
+            coordinator.seek_offset = message.offset + 1
+
+            true
+          end
+
           # No actions needed for the standard flow here
           def handle_before_schedule_consume
-            Karafka.monitor.instrument('consumer.before_schedule_consume', caller: self)
+            monitor.instrument('consumer.before_schedule_consume', caller: self)
 
             nil
           end
@@ -203,8 +288,8 @@ module Karafka
             # This can happen primarily when an LRJ job gets to the internal worker queue and
             # this partition is revoked prior processing.
             unless revoked?
-              Karafka.monitor.instrument('consumer.consume', caller: self)
-              Karafka.monitor.instrument('consumer.consumed', caller: self) do
+              monitor.instrument('consumer.consume', caller: self)
+              monitor.instrument('consumer.consumed', caller: self) do
                 consume
               end
             end
@@ -250,8 +335,8 @@ module Karafka
               coordinator.revoke
             end
 
-            Karafka.monitor.instrument('consumer.revoke', caller: self)
-            Karafka.monitor.instrument('consumer.revoked', caller: self) do
+            monitor.instrument('consumer.revoke', caller: self)
+            monitor.instrument('consumer.revoked', caller: self) do
               revoked
             end
           ensure
@@ -260,15 +345,15 @@ module Karafka
 
           # No action needed for the tick standard flow
           def handle_before_schedule_tick
-            Karafka.monitor.instrument('consumer.before_schedule_tick', caller: self)
+            monitor.instrument('consumer.before_schedule_tick', caller: self)
 
             nil
           end
 
           # Runs the consumer `#tick` method with reporting
           def handle_tick
-            Karafka.monitor.instrument('consumer.tick', caller: self)
-            Karafka.monitor.instrument('consumer.ticked', caller: self) do
+            monitor.instrument('consumer.tick', caller: self)
+            monitor.instrument('consumer.ticked', caller: self) do
               tick
             end
           ensure

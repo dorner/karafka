@@ -1,6 +1,18 @@
 # Karafka Framework Changelog
 
-## 2.4.14 (Unreleased)
+## 2.4.16 (Unreleased)
+- [Enhancement] Introduce `Consumer#wrap` for connection pooling management and other wrapped operations.
+- [Enhancement] Guard transactional operations from marking beyond assignment ownership under some extreme edge-cases.
+- [Enhancement] Improve VPs work with transactional producers.
+- [Enhancement] Prevent non-transactional operations leakage into transactional managed offset management consumers.
+- [Fix] Prevent transactions from being marked with a non-transactional default producer when automatic offset management and other advanced features are on.
+- [Fix] Fix `kafka_format` `KeyError` that occurs when a non-hash is assigned to the kafka scope of the settings.
+
+## 2.4.15 (2024-12-04)
+- [Fix] Assignment tracker current state fetch during a rebalance loop can cause an error on multi CG setup.
+- [Fix] Prevent double post-transaction offset dispatch to Kafka.
+
+## 2.4.14 (2024-11-25)
 - [Enhancement] Improve low-level critical error reporting.
 - [Enhancement] Expand Kubernetes Liveness state reporting with critical errors detection.
 - [Enhancement] Save several string allocations and one array allocation on each job execution when using Datadog instrumentation.
